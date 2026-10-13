@@ -116,6 +116,7 @@ mod tests {
         assert!(find_targets(root.path()).targets.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn ignores_a_symlinked_target() {
         let root = tempfile::tempdir().unwrap();

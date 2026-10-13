@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 
 use cargo_sweep::discover;
-use cargo_sweep::live::Via;
+use cargo_sweep::live::{Processes, Via};
 use cargo_sweep::sweep::{self, Options, Outcome};
 
 /// Clean stale Rust build caches under a directory.
@@ -57,7 +57,8 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<bool> {
     let root = match cli.root {
         Some(root) => root,
-        None => PathBuf::from(std::env::var_os("HOME").context("HOME is not set; pass --root")?)
+        None => std::env::home_dir()
+            .context("no home directory found; pass --root")?
             .join("Dev"),
     };
     if !root.is_dir() {
@@ -66,7 +67,7 @@ fn run(cli: Cli) -> Result<bool> {
     let options = Options {
         cutoff: SystemTime::now() - DAY * cli.days,
         apply: cli.apply,
-        proc_root: PathBuf::from("/proc"),
+        processes: Processes::native(),
         own_pid: std::process::id(),
     };
 

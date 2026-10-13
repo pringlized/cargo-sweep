@@ -1,16 +1,15 @@
 //! Deciding what inside a target dir is stale, and how much deleting it frees.
 //!
-//! "Last used" is the later of a file's access and modification times. The filesystem must be
-//! mounted `relatime` (the Linux default) or `strictatime` for access times to mean anything: then
-//! an rlib a build still links against, or a fingerprint Cargo still reads, stays fresh even if it
-//! was compiled months ago. Directories only count their modification time, because merely listing
+//! "Last used" is the later of a file's access and modification times. The filesystem must update
+//! access times for them to mean anything (on Linux, mounted `relatime`, the default, or
+//! `strictatime`): then an rlib a build still links against, or a fingerprint Cargo still reads,
+//! stays fresh even if it was compiled months ago. Directories only count their modification time, because merely listing
 //! a directory (as this tool does) updates its access time.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::{self, Metadata};
 use std::io;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
@@ -189,10 +188,13 @@ pub fn is_deletable(target: &Path, unit: &Path) -> bool {
 /// Counts allocated blocks, not apparent sizes. Cargo hard-links binaries out of `deps/` and
 /// incremental sessions hard-link their predecessors' files, so a file is only counted when every
 /// one of its links is among the units; otherwise removing it frees nothing.
+///
+/// On Windows, stable Rust exposes neither allocated size nor hard-link identity, so each file
+/// counts at its apparent size, once per link. The figure can come out high there.
 pub fn reclaimable_bytes(units: &[Unit]) -> u64 {
     // (device, inode) -> (links seen among the units, total links, bytes)
-    let mut files: HashMap<(u64, u64), (u64, u64, u64)> = HashMap::new();
-    let mut dir_bytes = 0;
+    let mut linked: HashMap<(u64, u64), (u64, u64, u64)> = HashMap::new();
+    let mut other_bytes = 0;
     for unit in units {
         for entry in WalkDir::new(&unit.path)
             .follow_links(false)
@@ -200,23 +202,44 @@ pub fn reclaimable_bytes(units: &[Unit]) -> u64 {
             .flatten()
         {
             let Ok(meta) = entry.metadata() else { continue };
-            let bytes = meta.blocks() * 512;
-            if meta.is_dir() {
-                dir_bytes += bytes;
-            } else {
-                files
-                    .entry((meta.dev(), meta.ino()))
-                    .or_insert((0, meta.nlink(), bytes))
-                    .0 += 1;
+            let bytes = allocated_bytes(&meta);
+            match link_identity(&meta) {
+                Some((id, links)) if !meta.is_dir() => {
+                    linked.entry(id).or_insert((0, links, bytes)).0 += 1;
+                }
+                _ => other_bytes += bytes,
             }
         }
     }
-    let file_bytes: u64 = files
+    let linked_bytes: u64 = linked
         .values()
         .filter(|(seen, links, _)| seen >= links)
         .map(|(_, _, bytes)| bytes)
         .sum();
-    dir_bytes + file_bytes
+    other_bytes + linked_bytes
+}
+
+#[cfg(unix)]
+fn allocated_bytes(meta: &Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.blocks() * 512
+}
+
+#[cfg(not(unix))]
+fn allocated_bytes(meta: &Metadata) -> u64 {
+    meta.len()
+}
+
+/// The file's (device, inode) and its number of links, where the platform tells.
+#[cfg(unix)]
+fn link_identity(meta: &Metadata) -> Option<((u64, u64), u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some(((meta.dev(), meta.ino()), meta.nlink()))
+}
+
+#[cfg(not(unix))]
+fn link_identity(_: &Metadata) -> Option<((u64, u64), u64)> {
+    None
 }
 
 #[cfg(test)]
@@ -373,6 +396,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlinks_are_units_not_followed() {
         let target = tempfile::tempdir().unwrap();
@@ -408,8 +432,10 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn hard_links_only_count_when_every_link_goes() {
+        use std::os::unix::fs::MetadataExt;
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
         fs::create_dir_all(d.join("deps")).unwrap();

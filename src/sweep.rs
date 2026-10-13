@@ -5,7 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::live::{self, LiveUse};
+use crate::live::{self, LiveUse, Processes};
 use crate::plan::{self, Unit};
 
 pub struct Options {
@@ -13,8 +13,8 @@ pub struct Options {
     pub cutoff: SystemTime,
     /// Delete; otherwise only report.
     pub apply: bool,
-    /// Where to look for running processes, normally `/proc`.
-    pub proc_root: PathBuf,
+    /// Where to look for running processes, normally [`Processes::native`].
+    pub processes: Processes,
     /// This process, which may itself run from a target dir being swept.
     pub own_pid: u32,
 }
@@ -42,8 +42,8 @@ pub struct Report {
 /// Sweeps one target dir.
 ///
 /// The live-process check runs after planning, immediately before any delete, so the window for a
-/// process to start in between is as short as it can be. An error means the target dir or `/proc`
-/// could not be read; nothing was deleted.
+/// process to start in between is as short as it can be. An error means the target dir or the
+/// process list could not be read; nothing was deleted.
 pub fn sweep_target(target: &Path, options: &Options) -> io::Result<Report> {
     let plan = plan::plan_target(target, options.cutoff)?;
     let bytes = plan::reclaimable_bytes(&plan.units);
@@ -55,7 +55,7 @@ pub fn sweep_target(target: &Path, options: &Options) -> io::Result<Report> {
     {
         names.push(resolved);
     }
-    if let Some(live) = live::find_live_use(&options.proc_root, &names, options.own_pid)? {
+    if let Some(live) = live::find_live_use(&options.processes, &names, options.own_pid)? {
         return Ok(Report {
             target: target.to_path_buf(),
             outcome: Outcome::Live(live),
@@ -91,18 +91,34 @@ pub fn sweep_target(target: &Path, options: &Options) -> io::Result<Report> {
 
 /// Removes a file, symlink, or directory tree. `remove_dir_all` does not follow symlinks.
 fn remove(path: &Path) -> io::Result<()> {
-    if fs::symlink_metadata(path)?.is_dir() {
+    let file_type = fs::symlink_metadata(path)?.file_type();
+    if file_type.is_dir() {
         fs::remove_dir_all(path)
+    } else if is_dir_link(&file_type) {
+        fs::remove_dir(path)
     } else {
         fs::remove_file(path)
     }
 }
 
+/// Windows makes a symlink (or junction) to a directory a directory entry of its own, removed with
+/// `remove_dir`. Elsewhere every symlink is removed like a file.
+#[cfg(windows)]
+fn is_dir_link(file_type: &fs::FileType) -> bool {
+    use std::os::windows::fs::FileTypeExt;
+    file_type.is_symlink_dir()
+}
+
+#[cfg(not(windows))]
+fn is_dir_link(_: &fs::FileType) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::live::Process;
     use crate::testutil::{age_dirs, days_ago, file};
-    use std::os::unix::fs::symlink;
 
     /// A target dir with one stale and one fresh cache entry, and an ancient release binary.
     fn target() -> tempfile::TempDir {
@@ -115,23 +131,31 @@ mod tests {
         target
     }
 
-    fn options(apply: bool, proc_root: &Path) -> Options {
+    fn options(apply: bool, processes: Processes) -> Options {
         Options {
             cutoff: days_ago(14),
             apply,
-            proc_root: proc_root.to_path_buf(),
+            processes,
             own_pid: 0,
         }
     }
 
-    fn empty_proc() -> tempfile::TempDir {
-        tempfile::tempdir().unwrap()
+    fn nothing_running() -> Processes {
+        Processes::Fixed(Vec::new())
+    }
+
+    fn running(pid: u32, exe: PathBuf) -> Processes {
+        Processes::Fixed(vec![Process {
+            pid,
+            exe: Some(exe),
+            args: Vec::new(),
+        }])
     }
 
     #[test]
     fn a_dry_run_deletes_nothing() {
-        let (target, proc) = (target(), empty_proc());
-        let report = sweep_target(target.path(), &options(false, proc.path())).unwrap();
+        let target = target();
+        let report = sweep_target(target.path(), &options(false, nothing_running())).unwrap();
 
         let Outcome::Stale {
             units,
@@ -149,9 +173,9 @@ mod tests {
 
     #[test]
     fn applying_deletes_only_the_stale_units() {
-        let (target, proc) = (target(), empty_proc());
+        let target = target();
         let t = target.path();
-        let report = sweep_target(t, &options(true, proc.path())).unwrap();
+        let report = sweep_target(t, &options(true, nothing_running())).unwrap();
 
         let Outcome::Stale {
             units, failures, ..
@@ -171,12 +195,11 @@ mod tests {
 
     #[test]
     fn a_live_process_skips_the_whole_target() {
-        let (target, proc) = (target(), empty_proc());
+        let target = target();
         let t = target.path();
-        fs::create_dir_all(proc.path().join("321")).unwrap();
-        symlink(t.join("release/server"), proc.path().join("321/exe")).unwrap();
+        let report =
+            sweep_target(t, &options(true, running(321, t.join("release/server")))).unwrap();
 
-        let report = sweep_target(t, &options(true, proc.path())).unwrap();
         let Outcome::Live(live) = report.outcome else {
             panic!("expected a live process")
         };
@@ -184,27 +207,31 @@ mod tests {
         assert!(t.join("debug/incremental/old-1").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_live_process_found_through_a_symlinked_path() {
-        let (target, proc) = (target(), empty_proc());
+        let target = target();
         let links = tempfile::tempdir().unwrap();
         let via_link = links.path().join("target");
-        symlink(target.path(), &via_link).unwrap();
+        std::os::unix::fs::symlink(target.path(), &via_link).unwrap();
         // The process reports the resolved path; the sweep was given the symlinked one.
         let resolved = fs::canonicalize(target.path()).unwrap();
-        fs::create_dir_all(proc.path().join("8")).unwrap();
-        symlink(resolved.join("release/server"), proc.path().join("8/exe")).unwrap();
 
-        let report = sweep_target(&via_link, &options(true, proc.path())).unwrap();
+        let report = sweep_target(
+            &via_link,
+            &options(true, running(8, resolved.join("release/server"))),
+        )
+        .unwrap();
         assert!(matches!(report.outcome, Outcome::Live(_)));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn no_proc_means_no_sweep() {
         let target = target();
         let result = sweep_target(
             target.path(),
-            &options(true, Path::new("/nonexistent/proc")),
+            &options(true, Processes::Proc(PathBuf::from("/nonexistent/proc"))),
         );
         assert!(result.is_err());
         assert!(target.path().join("debug/incremental/old-1").exists());

@@ -1,4 +1,4 @@
-//! Clean stale Rust build caches across a Linux dev machine.
+//! Clean stale Rust build caches across a dev machine.
 //!
 //! The rules, in the order they protect you:
 //! - Anything named `release` is never touched, at any depth. No flag overrides it.
